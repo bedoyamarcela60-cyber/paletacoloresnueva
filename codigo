@@ -1,0 +1,848 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { cn } from "@/utils/cn";
+import { analyzeImage, type Analysis } from "@/lib/analyze";
+import { renderDemo, DEMOS, type DemoKind } from "@/lib/demo";
+import { detectHarmony, diagnose, harmonySchemes, suggestFonts, suggestUses } from "@/lib/suggest";
+import { clamp, hexToRgb, hslToRgb, readableOn, rgbToHex, rgbToHsl } from "@/lib/color";
+import type { ImageMeta } from "@/lib/types";
+import { clearHash, decodeReport, readHash, reportUrl } from "@/lib/share";
+import Viewer from "@/components/Viewer";
+import MetaBar from "@/components/MetaBar";
+import SpectrumBand from "@/components/SpectrumBand";
+import PalettePanel from "@/components/PalettePanel";
+import ColorimetryPanel from "@/components/ColorimetryPanel";
+import ColorScience from "@/components/ColorScience";
+import { FontsPanel, UsesPanel } from "@/components/Recommendations";
+import ExportPanel from "@/components/ExportPanel";
+import { Chip, GhostButton, Icon, Panel, ToastHost, copyText, toast } from "@/components/ui";
+
+const MAX_PINNED = 14;
+const MAX_HISTORY = 6;
+
+function tuneAccent(hex: string, minL = 58): string {
+  const { r, g, b } = hexToRgb(hex);
+  const { h, s, l } = rgbToHsl(r, g, b);
+  const c = hslToRgb(h, clamp(Math.max(s, 42), 0, 92), Math.max(l, minL));
+  return rgbToHex(c.r, c.g, c.b);
+}
+
+export default function App() {
+  const [meta, setMeta] = useState<ImageMeta | null>(null);
+  const [img, setImg] = useState<HTMLImageElement | null>(null);
+  const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [pinned, setPinned] = useState<string[]>([]);
+  const [selectedHex, setSelectedHex] = useState<string | null>(null);
+  const [history, setHistory] = useState<ImageMeta[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [shared, setShared] = useState(false);
+  const [showKeys, setShowKeys] = useState(false);
+  const [showDemoMenu, setShowDemoMenu] = useState(false);
+
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const dragCount = useRef(0);
+
+  /* ---------------- carga de fuentes de imagen ---------------- */
+
+  const loadSource = useCallback((dataUrl: string, base: Omit<ImageMeta, "width" | "height">) => {
+    sharedRef.current = false;
+    setShared(false);
+    clearHash();
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => {
+      const width = image.naturalWidth || image.width || 800;
+      const height = image.naturalHeight || image.height || 600;
+      const next: ImageMeta = { ...base, width, height };
+      setMeta(next);
+      setImg(image);
+      setAnalysis(null);
+      setSelectedHex(null);
+      setAnalyzing(true);
+      setFailed(false);
+      setHistory((h) => [next, ...h.filter((x) => x.dataUrl !== next.dataUrl)].slice(0, MAX_HISTORY));
+    };
+    image.onerror = () => {
+      setAnalyzing(false);
+      toast("No se pudo decodificar el archivo", "warn");
+    };
+    image.src = dataUrl;
+  }, []);
+
+  const handleFile = useCallback(
+    (file: File) => {
+      if (!file.type.startsWith("image/")) {
+        toast("El archivo no es una imagen válida", "warn");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        loadSource(String(reader.result), {
+          name: file.name,
+          type: file.type,
+          size: file.size,
+          dataUrl: String(reader.result),
+          origin: "archivo",
+        });
+      };
+      reader.onerror = () => toast("Error de lectura del archivo", "warn");
+      reader.readAsDataURL(file);
+    },
+    [loadSource],
+  );
+
+  const handleDemo = useCallback(
+    (kind: DemoKind) => {
+      setShowDemoMenu(false);
+      setAnalyzing(true);
+      window.setTimeout(() => {
+        const asset = renderDemo(kind);
+        loadSource(asset.dataUrl, { name: asset.name, type: asset.type, size: asset.size, dataUrl: asset.dataUrl, origin: "demo" });
+      }, 60);
+    },
+    [loadSource],
+  );
+
+  const openFile = useCallback(() => fileRef.current?.click(), []);
+
+  /* ---------------- informe público abierto desde un enlace ---------------- */
+  const bootRef = useRef(false);
+  const sharedRef = useRef(false);
+
+  useEffect(() => {
+    const code = readHash();
+    if (!code) return;
+    const restored = decodeReport(code);
+    if (!restored) {
+      clearHash();
+      toast("El enlace del informe no es válido", "warn");
+      return;
+    }
+    sharedRef.current = true;
+    bootRef.current = true;
+    setShared(true);
+    setFailed(false);
+    setAnalyzing(false);
+    setMeta(restored.meta);
+    setAnalysis(restored.analysis);
+    setSelectedHex(restored.analysis.palette[0]?.hex ?? null);
+    setHistory((h) => [restored.meta, ...h.filter((x) => x.dataUrl !== restored.meta.dataUrl)].slice(0, MAX_HISTORY));
+    const image = new Image();
+    image.onload = () => setImg(image);
+    image.src = restored.preview;
+    toast("Informe abierto desde un enlace público", "info");
+  }, []);
+
+  /* ---------------- arranque: la app abre ya analizando una escena ---------------- */
+  useEffect(() => {
+    if (bootRef.current) return;
+    const t = window.setTimeout(() => {
+      bootRef.current = true;
+      handleDemo("aurora");
+    }, 380);
+    return () => window.clearTimeout(t);
+  }, [handleDemo]);
+
+  /* ---------------- análisis ---------------- */
+
+  const onCanvasReady = useCallback((canvas: HTMLCanvasElement) => {
+    if (sharedRef.current) {
+      setAnalyzing(false);
+      return;
+    }
+    setAnalyzing(true);
+    requestAnimationFrame(() => {
+      try {
+        const result = analyzeImage(canvas);
+        if (result.palette.length === 0) throw new Error("empty-palette");
+        setAnalysis(result);
+        setSelectedHex(result.palette[0]?.hex ?? null);
+        toast(`Análisis completo · ${result.palette.length} tonos en ${result.elapsedMs.toFixed(0)} ms`, "ok");
+      } catch {
+        setFailed(true);
+        toast("No se pudieron leer los píxeles", "warn");
+      } finally {
+        setAnalyzing(false);
+      }
+    });
+  }, []);
+
+  /* ---------------- acentos dinámicos de la interfaz ---------------- */
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (!analysis) {
+      root.style.setProperty("--dyn-accent", "#f5a524");
+      root.style.setProperty("--dyn-accent2", "#2dd4bf");
+      root.style.setProperty("--dyn-accent-text", "#06080c");
+      return;
+    }
+    const accent = tuneAccent(analysis.stats.accentHex);
+    const secondary = tuneAccent(analysis.stats.secondaryHex, 52);
+    root.style.setProperty("--dyn-accent", accent);
+    root.style.setProperty("--dyn-accent2", secondary === accent ? tuneAccent(analysis.stats.avgHex, 50) : secondary);
+    root.style.setProperty("--dyn-accent-text", readableOn(accent));
+  }, [analysis]);
+
+  /* ---------------- bandeja ---------------- */
+
+  const pin = useCallback((hex: string) => {
+    setPinned((p) => (p.includes(hex) ? p : [...p, hex].slice(-MAX_PINNED)));
+  }, []);
+  const unpin = useCallback((hex: string) => setPinned((p) => p.filter((x) => x !== hex)), []);
+
+  /* ---------------- arrastrar y soltar (global) ---------------- */
+
+  useEffect(() => {
+    const onEnter = (e: DragEvent) => {
+      if (!e.dataTransfer?.types?.includes("Files")) return;
+      dragCount.current++;
+      setDragging(true);
+    };
+    const onLeave = () => {
+      dragCount.current = Math.max(0, dragCount.current - 1);
+      if (dragCount.current === 0) setDragging(false);
+    };
+    const onOver = (e: DragEvent) => e.preventDefault();
+    const onDrop = (e: DragEvent) => {
+      e.preventDefault();
+      dragCount.current = 0;
+      setDragging(false);
+      const file = e.dataTransfer?.files?.[0];
+      if (file) handleFile(file);
+    };
+    window.addEventListener("dragenter", onEnter);
+    window.addEventListener("dragleave", onLeave);
+    window.addEventListener("dragover", onOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onEnter);
+      window.removeEventListener("dragleave", onLeave);
+      window.removeEventListener("dragover", onOver);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, [handleFile]);
+
+  /* ---------------- pegar desde portapapeles ---------------- */
+
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const item = Array.from(e.clipboardData?.items ?? []).find((i) => i.type.startsWith("image/"));
+      if (!item) return;
+      const file = item.getAsFile();
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () =>
+        loadSource(String(reader.result), {
+          name: `portapapeles-${new Date().toLocaleTimeString("es-ES")}.png`,
+          type: file.type,
+          size: file.size,
+          dataUrl: String(reader.result),
+          origin: "portapapeles",
+        });
+      reader.readAsDataURL(file);
+      toast("Imagen pegada desde el portapapeles", "info");
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [loadSource]);
+
+  /* ---------------- atajos de teclado ---------------- */
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "?") setShowKeys((v) => !v);
+      else if (e.key === "Escape") {
+        setShowKeys(false);
+        setShowDemoMenu(false);
+      } else if (e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        openFile();
+      } else if (["1", "2", "3", "4"].includes(e.key)) handleDemo(DEMOS[Number(e.key) - 1].kind);
+      else if (e.key.toLowerCase() === "p" && analysis?.palette[0]) {
+        pin(analysis.palette[0].hex);
+        toast(`${analysis.palette[0].hex} fijado en la bandeja`, "info");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openFile, handleDemo, analysis, pin]);
+
+  /* ---------------- compartir enlace público ---------------- */
+
+  const shareReport = useCallback(async () => {
+    if (!analysis || !meta) {
+      toast("Analiza una imagen antes de compartir", "warn");
+      return;
+    }
+    const url = reportUrl(analysis, meta);
+    window.history.replaceState(null, "", url);
+    setShared(true);
+    sharedRef.current = true;
+    const data = {
+      title: `CROMA · ${meta.name}`,
+      text: `Informe cromático de ${meta.name}: ${analysis.palette.length} tonos, ${analysis.stats.temperatureLabel.toLowerCase()}, ${analysis.stats.contrastLabel.toLowerCase()}.`,
+      url,
+    };
+    if (navigator.share) {
+      try {
+        await navigator.share(data);
+        toast("Enlace compartido", "ok");
+        return;
+      } catch {
+        /* el usuario canceló el diálogo nativo */
+      }
+    }
+    await copyText(url, "Enlace público copiado al portapapeles");
+  }, [analysis, meta]);
+
+  const publicUrl = useMemo(() => (analysis && meta ? reportUrl(analysis, meta) : null), [analysis, meta]);
+
+  const closeSharedReport = useCallback(() => {
+    sharedRef.current = false;
+    setShared(false);
+    clearHash();
+    setAnalysis(null);
+    setMeta(null);
+    setImg(null);
+    setSelectedHex(null);
+  }, []);
+
+  /* ---------------- derivaciones ---------------- */
+
+  const derived = useMemo(() => {
+    if (!analysis || !meta) return null;
+    const harmony = detectHarmony(analysis.palette);
+    const accentSwatch = analysis.palette.find((p) => p.hex === analysis.stats.accentHex) ?? analysis.palette[0];
+    const schemes = harmonySchemes(accentSwatch);
+    if (!accentSwatch) return null;
+    const advice = suggestFonts(analysis);
+    const uses = suggestUses(analysis, meta.width, meta.height);
+    const diagnosis = diagnose(analysis);
+    return { harmony, schemes, advice, uses, diagnosis };
+  }, [analysis, meta]);
+
+  const miniPalette = analysis?.palette.slice(0, 8) ?? [];
+
+  return (
+    <div className="relative min-h-screen">
+      {/* Fondo ambiental por capas */}
+      <div className="ambient">
+        <div className="ambient-tint" />
+        <div className="ambient-grid" />
+        <div className="ambient-scan" />
+        <div className="ambient-noise" />
+      </div>
+
+      <div className="relative z-10 flex min-h-screen flex-col">
+        {/* ---------------- Barra de mando ---------------- */}
+        <header className="sticky top-0 z-40 border-b border-ink-700/70 bg-ink-950/82 backdrop-blur-xl">
+          <div className="mx-auto flex w-full max-w-[1680px] flex-wrap items-center gap-3 px-3 py-2.5 sm:px-5">
+            <div className="flex items-center gap-3">
+              <div className="relative grid h-9 w-9 place-items-center overflow-hidden rounded-[10px] border border-ink-600 bg-ink-900">
+                <span className="absolute inset-0 flex">
+                  {(miniPalette.length ? miniPalette : [{ hex: "#f5a524" }, { hex: "#2dd4bf" }, { hex: "#fb7185" }]).slice(0, 4).map((c, i) => (
+                    <span key={i} className="h-full flex-1" style={{ background: c.hex }} />
+                  ))}
+                </span>
+                <span className="absolute inset-[3px] grid place-items-center rounded-[7px] bg-ink-950/85 font-display text-[13px] font-extrabold text-ink-100">
+                  C
+                </span>
+              </div>
+              <div className="leading-tight">
+                <h1 className="flex items-center gap-2 font-display text-[17px] font-extrabold tracking-[-0.01em] text-ink-100">
+                  CROMA
+                  <span className="rounded border border-ink-600 bg-ink-850 px-1.5 py-px font-mono text-[9px] font-medium tracking-[0.14em] text-ink-400 uppercase">
+                    inspector v3
+                  </span>
+                </h1>
+                <p className="hidden text-[10.5px] text-ink-400 sm:block">
+                  Colorimetría · activos de marca · tipografías — todo en tu navegador
+                </p>
+              </div>
+            </div>
+
+            {/* mini espectro en la barra */}
+            {miniPalette.length > 0 && (
+              <button
+                onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+                className="mx-1 hidden h-7 min-w-[120px] flex-1 overflow-hidden rounded-md border border-ink-700 transition hover:border-accent/50 md:flex"
+                title="Volver al espectro"
+              >
+                {miniPalette.map((c, i) => (
+                  <span key={i} className="h-full" style={{ flexGrow: Math.max(c.pct, 2), background: c.hex }} />
+                ))}
+              </button>
+            )}
+
+            <div className="ml-auto flex items-center gap-1.5">
+              <div className="relative">
+                {showDemoMenu && <div className="fixed inset-0 z-40" onClick={() => setShowDemoMenu(false)} aria-hidden="true" />}
+                <GhostButton onClick={() => setShowDemoMenu((v) => !v)} active={showDemoMenu} className="relative z-50">
+                  <Icon name="wand" size={13} /> Demo
+                  <Icon name={showDemoMenu ? "close" : "plus"} size={10} />
+                </GhostButton>
+                {showDemoMenu && (
+                  <div className="pop-in absolute right-0 z-50 mt-2 w-[248px] overflow-hidden rounded-lg border border-ink-600 bg-ink-900/97 p-1.5 shadow-[0_30px_60px_-24px_rgba(0,0,0,1)] backdrop-blur">
+                    <p className="px-2 py-1 font-mono text-[9.5px] tracking-[0.16em] text-ink-500 uppercase">escenas generadas · teclas 1-4</p>
+                    {DEMOS.map((d, i) => (
+                      <button
+                        key={d.kind}
+                        onClick={() => handleDemo(d.kind)}
+                        className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition hover:bg-ink-800"
+                      >
+                        <span className="flex h-6 w-9 shrink-0 overflow-hidden rounded border border-ink-600">
+                          {d.chips.map((c) => (
+                            <span key={c} className="h-full flex-1" style={{ background: c }} />
+                          ))}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[11.5px] font-medium text-ink-100">{d.label}</span>
+                          <span className="block truncate text-[10px] text-ink-500">{d.hint}</span>
+                        </span>
+                        <span className="font-mono text-[10px] text-ink-600">{i + 1}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <GhostButton onClick={shareReport} title="Copiar o compartir el enlace público de este informe">
+                <Icon name="link" size={13} />
+                <span className="hidden sm:inline">Compartir</span>
+              </GhostButton>
+
+              <GhostButton onClick={() => setShowKeys(true)} title="Atajos de teclado (?)">
+                <Icon name="keyboard" size={13} />
+                <span className="hidden sm:inline">Atajos</span>
+              </GhostButton>
+
+              <button
+                onClick={openFile}
+                className="inline-flex items-center gap-2 rounded-lg bg-accent px-3.5 py-2 text-[12.5px] font-semibold shadow-[0_14px_30px_-16px_var(--dyn-accent)] transition hover:brightness-110 active:scale-[0.98]"
+                style={{ color: "var(--dyn-accent-text, #06080c)" }}
+              >
+                <Icon name="upload" size={14} /> Abrir imagen
+              </button>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) handleFile(f);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+          </div>
+          <div className="hairline h-px w-full opacity-60" />
+        </header>
+
+        {/* ---------------- Contenido ---------------- */}
+        <main className="mx-auto w-full max-w-[1680px] flex-1 px-3 pt-4 pb-14 sm:px-5">
+          <SpectrumBand analysis={analysis} meta={meta} onSelect={setSelectedHex} selected={selectedHex} />
+
+          <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-12 lg:gap-5">
+            {/* Columna izquierda: escenario */}
+            <div className="flex flex-col gap-4 lg:col-span-7 xl:col-span-7">
+              <div className="lg:sticky lg:top-[84px] lg:z-20">
+                {shared && (
+                  <div className="pop-in mb-3 flex flex-wrap items-center gap-3 rounded-lg border border-accent/35 bg-accent/[0.07] px-3.5 py-2.5">
+                    <Icon name="link" size={15} className="text-accent" />
+                    <p className="min-w-[220px] flex-1 text-[11.5px] leading-relaxed text-ink-300">
+                      <span className="font-semibold text-ink-100">Informe abierto desde un enlace público.</span> Paleta, histograma, métricas y
+                      tokens viajan codificados en el propio URL — la imagen original nunca se sube. El lienzo muestra una reconstrucción con los
+                      tonos extraídos.
+                    </p>
+                    <div className="flex gap-1.5">
+                      <GhostButton onClick={shareReport}>
+                        <Icon name="copy" size={12} /> Copiar enlace
+                      </GhostButton>
+                      <GhostButton onClick={closeSharedReport}>
+                        <Icon name="close" size={12} /> Cerrar
+                      </GhostButton>
+                    </div>
+                  </div>
+                )}
+                <Viewer
+                  img={img}
+                  meta={meta}
+                  analyzing={analyzing}
+                  pinned={pinned}
+                  onPin={pin}
+                  onUnpin={unpin}
+                  onCanvasReady={onCanvasReady}
+                  onLoadDemo={handleDemo}
+                  onOpenFile={openFile}
+                />
+              </div>
+
+              {meta && analysis && (
+                <div className="panel reveal is-visible p-4">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h2 className="flex items-center gap-2 font-display text-[14px] font-bold tracking-tight text-ink-100">
+                      <Icon name="scan" size={14} className="text-accent" /> Ficha técnica del archivo
+                    </h2>
+                    <Chip>{meta.origin}</Chip>
+                  </div>
+                  <MetaBar meta={meta} analysis={analysis} />
+                </div>
+              )}
+
+              {/* Historial de sesión */}
+              <div className="panel reveal is-visible p-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="flex items-center gap-2 font-display text-[14px] font-bold tracking-tight text-ink-100">
+                    <Icon name="history" size={14} className="text-accent" /> Historial de sesión
+                  </h2>
+                  {history.length > 0 && (
+                    <button onClick={() => setHistory([])} className="font-mono text-[10px] text-ink-500 transition hover:text-signal-rose">
+                      limpiar
+                    </button>
+                  )}
+                </div>
+                {history.length === 0 ? (
+                  <p className="text-[11.5px] leading-relaxed text-ink-500">
+                    Las imágenes que analices aparecerán aquí para comparar lecturas sin volver a subirlas. Nada se envía a un servidor.
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+                    {history.map((h) => (
+                      <button
+                        key={h.dataUrl}
+                        onClick={() => loadSource(h.dataUrl, { name: h.name, type: h.type, size: h.size, dataUrl: h.dataUrl, origin: h.origin })}
+                        className={cn(
+                          "group overflow-hidden rounded-md border transition-all duration-200 hover:-translate-y-0.5",
+                          meta?.dataUrl === h.dataUrl ? "border-accent" : "border-ink-700 hover:border-ink-500",
+                        )}
+                        title={h.name}
+                      >
+                        <img src={h.dataUrl} alt={h.name} className="h-12 w-full object-cover transition group-hover:scale-105" />
+                        <span className="block truncate bg-ink-900 px-1.5 py-1 text-left font-mono text-[8.5px] text-ink-400">{h.name}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Columna derecha: lecturas */}
+            <div className="flex flex-col gap-4 lg:col-span-5 xl:col-span-5">
+              {!meta ? (
+                <IdleCapabilities onDemo={handleDemo} />
+              ) : !analysis || !derived ? (
+                failed ? (
+                  <FailCard
+                    onRetry={() =>
+                      loadSource(meta.dataUrl, { name: meta.name, type: meta.type, size: meta.size, dataUrl: meta.dataUrl, origin: meta.origin })
+                    }
+                    onDemo={handleDemo}
+                  />
+                ) : (
+                  <AnalyzingSkeleton />
+                )
+              ) : (
+                <>
+                  <Panel
+                    index="01"
+                    notch
+                    icon="palette"
+                    title="Paleta cromática dominante"
+                    subtitle="Cuantización por corte medial sobre el píxel real, con nomenclatura aproximada y escala tonal derivada."
+                    delay={0}
+                    actions={<Chip tone="accent">{analysis.palette.length} tonos</Chip>}
+                  >
+                    <PalettePanel palette={analysis.palette} onPin={pin} />
+                  </Panel>
+
+                  <Panel
+                    index="02"
+                    icon="thermo"
+                    title="Colorimetría y atmósfera"
+                    subtitle="Métricas perceptuales: temperatura, saturación, luminancia, contraste, colorfulness y complejidad."
+                    delay={60}
+                  >
+                    <ColorimetryPanel a={analysis} diagnosis={derived.diagnosis} />
+                  </Panel>
+
+                  <Panel
+                    index="03"
+                    icon="target"
+                    title="Armonía, contraste y tokens"
+                    subtitle="Clasificación armónica sobre la rueda cromática, matriz WCAG 2.1 y kit de interfaz derivado."
+                    delay={120}
+                    actions={
+                      <GhostButton onClick={() => copyText(derived.harmony.label, "Armonía copiada")} className="py-1">
+                        <Icon name="copy" size={11} />
+                      </GhostButton>
+                    }
+                  >
+                    <ColorScience
+                      palette={analysis.palette}
+                      harmony={derived.harmony}
+                      schemes={derived.schemes}
+                      kit={analysis.uiKit}
+                      onPin={pin}
+                    />
+                  </Panel>
+
+                  <Panel
+                    index="04"
+                    icon="type"
+                    title="Tipografías recomendadas"
+                    subtitle="Parejas display + texto elegidas según temperatura, cromatismo y complejidad. Previsualización real cargada bajo demanda."
+                    delay={180}
+                    actions={<Chip>{derived.advice.pairings.length} parejas</Chip>}
+                  >
+                    <FontsPanel advice={derived.advice} />
+                  </Panel>
+
+                  <Panel
+                    index="05"
+                    icon="compass"
+                    title="Usos y destinos gráficos"
+                    subtitle="Aptitud calculada por proporción y resolución frente a cada lienzo objetivo, con instrucciones de recorte."
+                    delay={240}
+                    actions={<Chip tone="good">{derived.uses.cases.filter((c) => c.fit > 75).length} óptimos</Chip>}
+                  >
+                    <UsesPanel cases={derived.uses.cases} print={derived.uses.print} meta={meta} />
+                  </Panel>
+
+                  <Panel
+                    index="06"
+                    icon="code"
+                    title="Exportación de activos"
+                    subtitle="Llévate la paleta como variables CSS, tema de Tailwind con escalas, SCSS, JSON o lámina SVG."
+                    delay={300}
+                  >
+                    <ExportPanel
+                      analysis={analysis}
+                      meta={meta}
+                      shareUrl={publicUrl}
+                      onShare={shareReport}
+                      advice={derived.advice}
+                      harmony={derived.harmony}
+                      diagnosis={derived.diagnosis}
+                      cases={derived.uses.cases}
+                      print={derived.uses.print}
+                    />
+                  </Panel>
+                </>
+              )}
+            </div>
+          </div>
+        </main>
+
+        {/* ---------------- Pie ---------------- */}
+        <footer className="border-t border-ink-700/60 bg-ink-950/70">
+          <div className="mx-auto flex w-full max-w-[1680px] flex-col gap-3 px-4 py-5 text-[11px] text-ink-500 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+            <p className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <Icon name="scan" size={12} className="text-accent" />
+              Procesado 100% local con Canvas API · ninguna imagen sale de tu equipo
+              <span className="text-ink-700">/</span>
+              corte medial · CIE Lab · Hasler–Süsstrunk · WCAG 2.1
+            </p>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {[
+                ["O", "abrir"],
+                ["1-4", "demos"],
+                ["P", "fijar"],
+                ["?", "atajos"],
+              ].map(([k, label]) => (
+                <span key={k} className="flex items-center gap-1">
+                  <kbd className="rounded border border-ink-600 bg-ink-850 px-1.5 py-0.5 font-mono text-[9.5px] text-ink-300">{k}</kbd>
+                  <span>{label}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        </footer>
+      </div>
+
+      {/* ---------------- Overlay de arrastre ---------------- */}
+      {dragging && (
+        <div className="fixed inset-0 z-[70] grid place-items-center bg-ink-950/80 backdrop-blur-sm">
+          <div className="pointer-events-none flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed border-accent/70 px-12 py-10">
+            <Icon name="upload" size={30} className="text-accent" />
+            <p className="font-display text-2xl font-bold text-ink-100">Suelta para analizar</p>
+            <p className="font-mono text-[11px] text-ink-400">PNG · JPG · WEBP · AVIF · GIF · BMP · SVG</p>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------- Atajos ---------------- */}
+      {showKeys && (
+        <div className="fixed inset-0 z-[90] grid place-items-center bg-ink-950/80 p-4 backdrop-blur-sm" onClick={() => setShowKeys(false)}>
+          <div className="panel pop-in w-full max-w-md p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="font-display text-lg font-bold text-ink-100">Atajos de teclado</h3>
+              <GhostButton onClick={() => setShowKeys(false)}>
+                <Icon name="close" size={12} />
+              </GhostButton>
+            </div>
+            <ul className="flex flex-col gap-2">
+              {[
+                ["O", "Abrir un archivo de imagen"],
+                ["Ctrl / ⌘ + V", "Pegar imagen del portapapeles"],
+                ["1 · 2 · 3 · 4", "Cargar una escena demo"],
+                ["P", "Fijar el tono dominante en la bandeja"],
+                ["Rueda del ratón", "Zoom sobre el lienzo"],
+                ["Arrastrar", "Desplazar con zoom activo"],
+                ["Clic en el lienzo", "Muestrear y fijar el píxel exacto"],
+                ["?", "Mostrar u ocultar esta ayuda"],
+              ].map(([k, d]) => (
+                <li key={k} className="flex items-center justify-between gap-4 border-b border-ink-800 pb-2 last:border-0">
+                  <span className="text-[12px] text-ink-300">{d}</span>
+                  <kbd className="shrink-0 rounded border border-ink-600 bg-ink-850 px-2 py-1 font-mono text-[10px] text-ink-100">{k}</kbd>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      <ToastHost />
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Estado vacío: índice de capacidades                                 */
+/* ------------------------------------------------------------------ */
+
+function IdleCapabilities({ onDemo }: { onDemo: (kind: DemoKind) => void }) {
+  const rows = [
+    { n: "01", t: "Paleta cromática dominante", d: "Hasta 8 tonos con HEX, RGB, HSL, CMYK, cobertura real, nombre aproximado y escala de 11 pasos.", icon: "palette" as const },
+    { n: "02", t: "Colorimetría y atmósfera", d: "Temperatura, saturación, luminancia, contraste, colorfulness Hasler–Süsstrunk, histograma y peso por familia de matiz.", icon: "thermo" as const },
+    { n: "03", t: "Armonía, contraste y tokens", d: "Clasificación armónica en la rueda, reparto 60/30/10, matriz WCAG 2.1 y kit de interfaz derivado.", icon: "target" as const },
+    { n: "04", t: "Tipografías recomendadas", d: "Parejas display + texto de Google Fonts acordes al clima visual, previsualizadas en vivo.", icon: "type" as const },
+    { n: "05", t: "Usos y destinos gráficos", d: "Aptitud por proporción y resolución para redes, web, vídeo e impresión, con guía de recorte.", icon: "compass" as const },
+    { n: "06", t: "Exportación de activos", d: "CSS, Tailwind con escalas, SCSS, JSON, lámina SVG e informe completo en Markdown.", icon: "code" as const },
+  ];
+
+  return (
+    <div className="panel reveal is-visible p-4 sm:p-5">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[10px] tracking-[0.22em] text-accent uppercase">índice de lectura</p>
+          <h2 className="mt-1 font-display text-[22px] leading-tight font-extrabold tracking-tight text-ink-100">
+            Qué extrae CROMA de tu imagen
+          </h2>
+        </div>
+        <span className="hidden h-10 w-10 shrink-0 place-items-center rounded-lg border border-accent/30 bg-accent/10 text-accent sm:grid">
+          <Icon name="sparkles" size={18} />
+        </span>
+      </div>
+
+      <ul className="flex flex-col">
+        {rows.map((r, i) => (
+          <li
+            key={r.n}
+            className="pop-in group flex gap-3.5 border-b border-ink-800 py-3 last:border-0"
+            style={{ animationDelay: `${i * 60}ms` }}
+          >
+            <span className="mt-0.5 font-mono text-[11px] font-semibold text-accent">{r.n}</span>
+            <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-md border border-ink-700 bg-ink-850 text-ink-300 transition-colors group-hover:border-accent/40 group-hover:text-accent">
+              <Icon name={r.icon} size={14} />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-[13px] font-semibold text-ink-100">{r.t}</span>
+              <span className="mt-0.5 block text-[11.5px] leading-relaxed text-ink-400">{r.d}</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+
+      <div className="mt-4 rounded-lg border border-ink-700/70 bg-ink-900/60 p-3.5">
+        <p className="mb-2.5 font-mono text-[10px] tracking-[0.18em] text-ink-500 uppercase">empieza con una escena generada</p>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {DEMOS.map((d, i) => (
+            <DemoButton key={d.kind} demo={d} index={i} onDemo={onDemo} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DemoButton({ demo, index, onDemo }: { demo: (typeof DEMOS)[number]; index: number; onDemo: (kind: DemoKind) => void }) {
+  return (
+    <button
+      onClick={() => onDemo(demo.kind)}
+      className="group flex items-center gap-2.5 rounded-lg border border-ink-700 bg-ink-850/80 p-2 text-left transition-all duration-200 hover:-translate-y-0.5 hover:border-accent/45"
+    >
+      <span className="flex h-8 w-8 shrink-0 overflow-hidden rounded-md border border-ink-600">
+        {demo.chips.map((c) => (
+          <span key={c} className="h-full flex-1" style={{ background: c }} />
+        ))}
+      </span>
+      <span className="min-w-0">
+        <span className="block truncate text-[12px] font-semibold text-ink-100">{demo.label}</span>
+        <span className="block truncate text-[10px] text-ink-400">{demo.hint}</span>
+      </span>
+      <span className="ml-auto font-mono text-[10px] text-ink-600">{index + 1}</span>
+    </button>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Estados intermedios                                                 */
+/* ------------------------------------------------------------------ */
+
+function AnalyzingSkeleton() {
+  return (
+    <div className="panel reveal is-visible flex flex-col gap-4 p-5">
+      <div className="flex items-center gap-3">
+        <span className="spin-slow grid h-8 w-8 place-items-center rounded-full border-2 border-ink-700 border-t-accent text-accent">
+          <Icon name="scan" size={14} />
+        </span>
+        <div>
+          <p className="font-display text-[15px] font-bold text-ink-100">Leyendo píxeles…</p>
+          <p className="font-mono text-[10.5px] text-ink-500">corte medial · CIE Lab · histogramas · métricas de atmósfera</p>
+        </div>
+      </div>
+      {[92, 76, 84, 60].map((w, i) => (
+        <div key={i} className="flex flex-col gap-2">
+          <div className="h-2.5 rounded-full bg-ink-800" style={{ width: `${w}%`, opacity: 1 - i * 0.16 }} />
+          <div className="h-2.5 rounded-full bg-ink-800/70" style={{ width: `${w - 22}%`, opacity: 1 - i * 0.16 }} />
+        </div>
+      ))}
+      <div className="grid grid-cols-4 gap-2">
+        {Array.from({ length: 8 }).map((_, i) => (
+          <div key={i} className="h-14 animate-pulse rounded-md bg-ink-800/80" style={{ animationDelay: `${i * 90}ms` }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FailCard({ onRetry, onDemo }: { onRetry: () => void; onDemo: (kind: DemoKind) => void }) {
+  return (
+    <div className="panel reveal is-visible p-6 text-center">
+      <span className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-xl border border-signal-rose/35 bg-signal-rose/10 text-signal-rose">
+        <Icon name="info" size={20} />
+      </span>
+      <h3 className="font-display text-lg font-bold text-ink-100">No pudimos leer los píxeles</h3>
+      <p className="mx-auto mt-1.5 max-w-[44ch] text-[12px] leading-relaxed text-ink-400">
+        Puede tratarse de un SVG sin dimensiones intrínsecas o de un archivo dañado. Reintenta, exporta la imagen como PNG/JPG o carga una escena demo.
+      </p>
+      <div className="mt-4 flex flex-wrap justify-center gap-2">
+        <button
+          onClick={onRetry}
+          className="inline-flex items-center gap-2 rounded-lg bg-accent px-3.5 py-2 text-[12px] font-semibold"
+          style={{ color: "var(--dyn-accent-text, #06080c)" }}
+        >
+          <Icon name="refresh" size={14} /> Reintentar
+        </button>
+        <GhostButton onClick={() => onDemo("aurora")}>
+          <Icon name="wand" size={13} /> Cargar demo
+        </GhostButton>
+      </div>
+    </div>
+  );
+}
